@@ -1,5 +1,5 @@
 //
-// LESS - Leaner CSS v1.0.22
+// LESS - Leaner CSS v1.0.23
 // http://lesscss.org
 // 
 // Copyright (c) 2010, Alexis Sellier
@@ -145,22 +145,16 @@ if (typeof(window) === 'undefined') {
 //
 // less.js - parser
 //
-//    A relatively straight-forward recursive-descent parser.
+//    A relatively straight-forward predictive parser.
 //    There is no tokenization/lexing stage, the input is parsed
 //    in one sweep.
 //
 //    To make the parser fast enough to run in the browser, several
 //    optimization had to be made:
 //
-//    - Instead of the more commonly used technique of slicing the
-//      input string on every match, we use global regexps (/g),
-//      and move the `lastIndex` pointer on match, foregoing `slice()`
-//      completely. This gives us a 3x speed-up.
-//
-//    - Matching on a huge input is often cause of slowdowns,
-//      especially with the /g flag. The solution to that is to
-//      chunkify the input: we split it by /\n\n/, just to be on
-//      the safe side. The chunks are stored in the `chunks` var,
+//    - Matching and slicing on a huge input is often cause of slowdowns.
+//      The solution is to chunkify the input into smaller strings.
+//      The chunks are stored in the `chunks` var,
 //      `j` holds the current chunk index, and `current` holds
 //      the index of the current chunk in relation to `input`.
 //      This gives us an almost 4x speed-up.
@@ -185,6 +179,8 @@ less.Parser = function Parser(env) {
     var input,       // LeSS input string
         i,           // current index in `input`
         j,           // current chunk
+        temp,        // temporarily holds a chunk's state, for backtracking
+        memo,        // temporarily holds `i`, when backtracking
         furthest,    // furthest index the parser has gone to
         chunks,      // chunkified input
         current,     // index of current chunk, in `input`
@@ -219,11 +215,20 @@ less.Parser = function Parser(env) {
         }
     };
 
+    function save()    { temp = chunks[j], memo = i, current = i }
+    function restore() { chunks[j] = temp, i = memo, current = i }
+
+    function sync() {
+        if (i > current) {
+            chunks[j] = chunks[j].slice(i - current);
+            current = i;
+        }
+    }
     //
     // Parse from a token, regexp or string, and move forward if match
     //
     function $(tok) {
-        var match, args, length, c, index, endIndex;
+        var match, args, length, c, index, endIndex, k;
 
         //
         // Non-terminal
@@ -239,6 +244,7 @@ less.Parser = function Parser(env) {
         } else if (typeof(tok) === 'string') {
             match = input.charAt(i) === tok ? tok : null;
             length = 1;
+            sync ();
 
         //  1. We move to the next chunk, if necessary.
         //  2. Set the `lastIndex` to be relative
@@ -249,16 +255,12 @@ less.Parser = function Parser(env) {
         //     index, which we stored in [2].
         //
         } else {
-            if (i >= current + chunks[j].length &&
-                j < chunks.length - 1) { // 1.
-                current += chunks[j++].length;
-            }
-            tok.lastIndex = index =  i - current; // 2.
-            match = tok.exec(chunks[j]);
+            sync ();
 
-            if (match) {
+            if (match = tok.exec(chunks[j])) { // 3.
                 length = match[0].length;
-                if (tok.lastIndex - length !== index) { return } // 3.
+            } else {
+                return null;
             }
         }
 
@@ -268,14 +270,18 @@ less.Parser = function Parser(env) {
         // grammar is mostly white-space insensitive.
         //
         if (match) {
-            i += length;
-            endIndex = current + chunks[j].length;
+            mem = i += length;
+            endIndex = i + chunks[j].length - length;
 
-            while (i <= endIndex) {
+            while (i < endIndex) {
                 c = input.charCodeAt(i);
                 if (! (c === 32 || c === 10 || c === 9)) { break }
                 i++;
             }
+            chunks[j] = chunks[j].slice(length + (i - mem));
+            current = i;
+
+            if (chunks[j].length === 0 && j < chunks.length - 1) { j++ }
 
             if(typeof(match) === 'string') {
                 return match;
@@ -288,16 +294,13 @@ less.Parser = function Parser(env) {
     // Same as $(), but don't change the state of the parser,
     // just return the match.
     function peek(tok) {
-        var match;
-
         if (typeof(tok) === 'string') {
             return input.charAt(i) === tok;
         } else {
-            tok.lastIndex = i;
-
-            if ((match = tok.exec(input)) &&
-               (tok.lastIndex - match[0].length === i)) {
-                return match;
+            if (tok.test(chunks[j])) {
+                return true;
+            } else {
+                return false;
             }
         }
     }
@@ -332,13 +335,10 @@ less.Parser = function Parser(env) {
             // removing comments (see rationale above),
             // depending on the level of optimization.
             if (that.optimization > 0) {
-                input = input.replace(/\/\*(?:[^*]|\*+[^\/*])*\*+\//g, function (comment) {
-                    return that.optimization > 1 ? '' : comment.replace(/\n(\s*\n)+/g, '\n');
-                });
                 if (that.optimization > 1) {
+                    input = input.replace(/\/\*(?:[^*]|\*+[^\/*])*\*+\//g, '');
                     chunks = (function (chunks) {
-                        var level = 0,
-                            j = 0,
+                        var j = 0,
                             skip = /[^"'\{\}]+/g,
                             match,
                             chunk,
@@ -358,15 +358,10 @@ less.Parser = function Parser(env) {
                             c = input.charAt(i);
 
                             if (c === '}' && !inString) {
-                                level --;
                                 chunk.push(c);
-                                if (level === 0) {
-                                    chunks[++j] = [];
-                                }
+                                chunks[++j] = [];
                             } else {
-                                if (c === '{' && !inString) {
-                                    level ++;
-                                } else if (c === '"' || c === "'") {
+                                if (c === '"' || c === "'") {
                                     inString = inString === c ? false : c;
                                 }
                                 chunk.push(c);
@@ -520,10 +515,10 @@ less.Parser = function Parser(env) {
             primary: function () {
                 var node, root = [];
 
-                while (node = $(this.mixin.definition) || $(this.rule)    ||  $(this.ruleset) ||
-                              $(this.mixin.call)       || $(this.comment) ||
-                              $(/[\n\s]+/g)            || $(this.directive)) {
-                    root.push(node);
+                while ((node = $(this.mixin.definition) || $(this.rule)    ||  $(this.ruleset) ||
+                               $(this.mixin.call)       || $(this.comment) ||  $(this.directive))
+                               || $(/^[\s\n]+/)) {
+                    node && root.push(node);
                 }
                 return root;
             },
@@ -537,8 +532,8 @@ less.Parser = function Parser(env) {
                 if (input.charAt(i) !== '/') return;
 
                 if (input.charAt(i + 1) === '/') {
-                    return new(tree.Comment)($(/\/\/.*/g), true);
-                } else if (comment = $(/\/\*(?:[^*]|\*+[^\/*])*\*+\/\n?/g)) {
+                    return new(tree.Comment)($(/^\/\/.*/), true);
+                } else if (comment = $(/^\/\*(?:[^*]|\*+[^\/*])*\*+\/\n?/)) {
                     return new(tree.Comment)(comment);
                 }
             },
@@ -556,7 +551,7 @@ less.Parser = function Parser(env) {
                     var str;
                     if (input.charAt(i) !== '"' && input.charAt(i) !== "'") return;
 
-                    if (str = $(/"((?:[^"\\\r\n]|\\.)*)"|'((?:[^'\\\r\n]|\\.)*)'/g)) {
+                    if (str = $(/^"((?:[^"\\\r\n]|\\.)*)"|'((?:[^'\\\r\n]|\\.)*)'/)) {
                         return new(tree.Quoted)(str[0], str[1] || str[2]);
                     }
                 },
@@ -568,7 +563,7 @@ less.Parser = function Parser(env) {
                 //
                 keyword: function () {
                     var k;
-                    if (k = $(/[A-Za-z-]+/g)) { return new(tree.Keyword)(k) }
+                    if (k = $(/^[A-Za-z-]+/)) { return new(tree.Keyword)(k) }
                 },
 
                 //
@@ -584,7 +579,7 @@ less.Parser = function Parser(env) {
                 call: function () {
                     var name, args;
 
-                    if (! (name = $(/([\w-]+|%)\(/g))) return;
+                    if (! (name = $(/^([\w-]+|%)\(/))) return;
 
                     if (name[1].toLowerCase() === 'alpha') { return $(this.alpha) }
 
@@ -619,8 +614,8 @@ less.Parser = function Parser(env) {
                 url: function () {
                     var value;
 
-                    if (input.charAt(i) !== 'u' || !$(/url\(/g)) return;
-                    value = $(this.entities.quoted) || $(/[-\w%@$\/.&=:;#+?]+/g);
+                    if (input.charAt(i) !== 'u' || !$(/^url\(/)) return;
+                    value = $(this.entities.quoted) || $(/^[-\w%@$\/.&=:;#+?]+/);
                     if (! $(')')) throw new(Error)("missing closing ) for url()");
 
                     return new(tree.URL)(value.value ? value : new(tree.Anonymous)(value));
@@ -637,7 +632,7 @@ less.Parser = function Parser(env) {
                 variable: function () {
                     var name, index = i;
 
-                    if (input.charAt(i) === '@' && (name = $(/@[\w-]+/g))) {
+                    if (input.charAt(i) === '@' && (name = $(/^@[\w-]+/))) {
                         return new(tree.Variable)(name, index);
                     }
                 },
@@ -652,7 +647,7 @@ less.Parser = function Parser(env) {
                 color: function () {
                     var rgb;
 
-                    if (input.charAt(i) === '#' && (rgb = $(/#([a-fA-F0-9]{6}|[a-fA-F0-9]{3})/g))) {
+                    if (input.charAt(i) === '#' && (rgb = $(/^#([a-fA-F0-9]{6}|[a-fA-F0-9]{3})/))) {
                         return new(tree.Color)(rgb[1]);
                     }
                 },
@@ -666,7 +661,7 @@ less.Parser = function Parser(env) {
                     var value, c = input.charCodeAt(i);
                     if ((c > 57 || c < 45) || c === 47) return;
 
-                    if (value = $(/(-?\d*\.?\d+)(px|%|em|pc|ex|in|deg|s|ms|pt|cm|mm)?/g)) {
+                    if (value = $(/^(-?\d*\.?\d+)(px|%|em|pc|ex|in|deg|s|ms|pt|cm|mm)?/)) {
                         return new(tree.Dimension)(value[1], value[2]);
                     }
                 }
@@ -680,7 +675,7 @@ less.Parser = function Parser(env) {
             variable: function () {
                 var name;
 
-                if (input.charAt(i) === '@' && (name = $(/(@[\w-]+)\s*:/g))) { return name[1] }
+                if (input.charAt(i) === '@' && (name = $(/^(@[\w-]+)\s*:/))) { return name[1] }
             },
 
             //
@@ -693,7 +688,7 @@ less.Parser = function Parser(env) {
             shorthand: function () {
                 var a, b;
 
-                if (! peek(/[@\w.-]+\/[@\w.-]+/g)) return;
+                if (! peek(/^[@\w.-]+\/[@\w.-]+/)) return;
 
                 if ((a = $(this.entity)) && $('/') && (b = $(this.entity))) {
                     return new(tree.Shorthand)(a, b);
@@ -716,9 +711,11 @@ less.Parser = function Parser(env) {
                 // selector for now.
                 //
                 call: function () {
-                    var elements = [], e, c, args, index = i;
+                    var elements = [], e, c, args, index = i, s = input.charAt(i);
 
-                    while (e = $(/[#.][\w-]+/g)) {
+                    if (s !== '.' && s !== '#') { return }
+
+                    while (e = $(/^[#.][\w-]+/)) {
                         elements.push(new(tree.Element)(c, e));
                         c = $('>');
                     }
@@ -751,12 +748,13 @@ less.Parser = function Parser(env) {
                 definition: function () {
                     var name, params = [], match, ruleset, param, value;
 
-                    if (input.charAt(i) !== '.' || peek(/[^{]*(;|})/g)) return;
+                    if (input.charAt(i) !== '.' || peek(/^[^{]*(;|})/)) return;
 
-                    if (match = $(/([#.][\w-]+)\s*\(/g)) {
+
+                    if (match = $(/^([#.][\w-]+)\s*\(/)) {
                         name = match[1];
 
-                        while (param = $(/@[\w-]+/g) || $(this.entities.literal)
+                        while (param = $(/^@[\w-]+/) || $(this.entities.literal)
                                                      || $(this.entities.keyword)) {
                             // Variable
                             if (param[0] === '@') {
@@ -811,8 +809,8 @@ less.Parser = function Parser(env) {
             alpha: function () {
                 var value;
 
-                if (! $(/opacity=/gi)) return;
-                if (value = $(/\d+/g) || $(this.entities.variable)) {
+                if (! $(/^opacity=/i)) return;
+                if (value = $(/^\d+/) || $(this.entities.variable)) {
                     if (! $(')')) throw new(Error)("missing closing ) for alpha()");
                     return new(tree.Alpha)(value);
                 }
@@ -834,7 +832,7 @@ less.Parser = function Parser(env) {
                 var e, t;
 
                 c = $(this.combinator);
-                e = $(/[.#:]?[\w-]+/g) || $('*') || $(this.attribute) || $(/\([^)@]+\)/g);
+                e = $(/^[.#:]?[\w-]+/) || $('*') || $(this.attribute) || $(/^\([^)@]+\)/);
 
                 if (e) { return new(tree.Element)(c, e) }
             },
@@ -849,11 +847,20 @@ less.Parser = function Parser(env) {
             // we deal with this in *combinator.js*.
             //
             combinator: function () {
-                var match;
-                if (match = $(/[+>~]/g) || $('&') || $(/::/g)) {
-                    return new(tree.Combinator)(match);
+                var match, c = input.charAt(i);
+
+                if (c === '>' || c === '&' || c === '+' || c === '~') {
+                    i++;
+                    while (input.charAt(i) === ' ') { i++ }
+                    return new(tree.Combinator)(c);
+                } else if (c === ':' && input.charAt(i + 1) === ':') {
+                    i += 2;
+                    while (input.charAt(i) === ' ') { i++ }
+                    return new(tree.Combinator)('::');
+                } else if (input.charAt(i - 1) === ' ') {
+                    return new(tree.Combinator)(" ");
                 } else {
-                    return new(tree.Combinator)(input.charAt(i - 1) === " " ? " " : null);
+                    return new(tree.Combinator)(null);
                 }
             },
 
@@ -866,23 +873,27 @@ less.Parser = function Parser(env) {
             // Selectors are made out of one or more Elements, see above.
             //
             selector: function () {
-                var sel, e, elements = [], match;
+                var sel, e, elements = [], c, match;
 
-                while (e = $(this.element)) { elements.push(e) }
+                while (e = $(this.element)) {
+                    c = input.charAt(i);
+                    elements.push(e)
+                    if (c === '{' || c === '}' || c === ';' || c === ',') { break }
+                }
 
                 if (elements.length > 0) { return new(tree.Selector)(elements) }
             },
             tag: function () {
-                return $(/[a-zA-Z][a-zA-Z-]*[0-9]?/g) || $('*');
+                return $(/^[a-zA-Z][a-zA-Z-]*[0-9]?/) || $('*');
             },
             attribute: function () {
                 var attr = '', key, val, op;
 
                 if (! $('[')) return;
 
-                if (key = $(/[a-z-]+/g) || $(this.entities.quoted)) {
-                    if ((op = $(/[|~*$^]?=/g)) &&
-                        (val = $(this.entities.quoted) || $(/[\w-]+/g))) {
+                if (key = $(/^[a-z-]+/) || $(this.entities.quoted)) {
+                    if ((op = $(/^[|~*$^]?=/)) &&
+                        (val = $(this.entities.quoted) || $(/^[\w-]+/))) {
                         attr = [key, op, val.toCSS ? val.toCSS() : val].join('');
                     } else { attr = key }
                 }
@@ -908,9 +919,10 @@ less.Parser = function Parser(env) {
             // div, .class, body > p {...}
             //
             ruleset: function () {
-                var selectors = [], s, rules, match, memo = i;
+                var selectors = [], s, rules, match;
+                save();
 
-                if (match = peek(/([.#: \w-]+)[\s\n]*\{/g)) {
+                if (match = /^([.#: \w-]+)[\s\n]*\{/.exec(chunks[j])) {
                     i += match[0].length - 1;
                     selectors = [new(tree.Selector)([new(tree.Element)(null, match[1])])];
                 } else {
@@ -926,15 +938,17 @@ less.Parser = function Parser(env) {
                 } else {
                     // Backtrack
                     furthest = i;
-                    i = memo;
+                    restore();
                 }
             },
             rule: function () {
-                var value;
-                var memo = i;
+                var value, c = input.charAt(i), important;
+                save();
 
-                if (name = $(this.property) || $(this.variable)) {
-                    if ((name.charAt(0) != '@') && (match = peek(/([^@+\/*(;{}-]*);/g))) {
+                if (c === '.' || c === '#' || c === '&') { return }
+
+                if (name = $(this.variable) || $(this.property)) {
+                    if ((name.charAt(0) != '@') && (match = /^([^@+\/*(;{}-]*);/.exec(chunks[j]))) {
                         i += match[0].length - 1;
                         value = new(tree.Anonymous)(match[1]);
                     } else if (name === "font") {
@@ -942,12 +956,13 @@ less.Parser = function Parser(env) {
                     } else {
                         value = $(this.value);
                     }
+                    important = $(this.important);
 
-                    if ($(this.end)) {
-                        return new(tree.Rule)(name, value, memo);
+                    if (value && $(this.end)) {
+                        return new(tree.Rule)(name, value, important, memo);
                     } else {
                         furthest = i;
-                        i = memo;
+                        restore();
                     }
                 }
             },
@@ -964,7 +979,7 @@ less.Parser = function Parser(env) {
             //
             "import": function () {
                 var path;
-                if ($(/@import\s+/g) &&
+                if ($(/^@import\s+/) &&
                     (path = $(this.entities.quoted) || $(this.entities.url)) &&
                     $(';')) {
                     return new(tree.Import)(path, imports);
@@ -983,12 +998,12 @@ less.Parser = function Parser(env) {
 
                 if (value = $(this['import'])) {
                     return value;
-                } else if (name = $(/@media|@page/g)) {
-                    types = $(/[^{]+/g).trim();
+                } else if (name = $(/^@media|@page/)) {
+                    types = $(/^[^{]+/).trim();
                     if (rules = $(this.block)) {
                         return new(tree.Directive)(name + " " + types, rules);
                     }
-                } else if (name = $(/@[-a-z]+/g)) {
+                } else if (name = $(/^@[-a-z]+/)) {
                     if (name === '@font-face') {
                         if (rules = $(this.block)) {
                             return new(tree.Directive)(name, rules);
@@ -1012,7 +1027,7 @@ less.Parser = function Parser(env) {
                         if (! $(',')) { break }
                     }
                 }
-                return new(tree.Value)(value, $(this.important));
+                return new(tree.Value)(value);
             },
 
             //
@@ -1030,14 +1045,15 @@ less.Parser = function Parser(env) {
                     expressions.push(e);
                     if (! $(',')) { break }
                 }
-                important = $(this.important);
 
                 if (expressions.length > 0) {
-                    return new(tree.Value)(expressions, important);
+                    return new(tree.Value)(expressions);
                 }
             },
             important: function () {
-                return $(/!\s*important/g);
+                if (input.charAt(i) === '!') {
+                    return $(/^! *important/);
+                }
             },
             sub: function () {
                 var e;
@@ -1049,7 +1065,7 @@ less.Parser = function Parser(env) {
             multiplication: function () {
                 var m, a, op, operation;
                 if (m = $(this.operand)) {
-                    while ((op = $(/[\/*]/g)) && (a = $(this.operand))) {
+                    while ((op = ($('/') || $('*'))) && (a = $(this.operand))) {
                         operation = new(tree.Operation)(op, [operation || m, a]);
                     }
                     return operation || m;
@@ -1058,7 +1074,7 @@ less.Parser = function Parser(env) {
             addition: function () {
                 var m, a, op, operation;
                 if (m = $(this.multiplication)) {
-                    while ((op = $(/[-+]\s+/g) || (input.charAt(i - 1) != ' ' && $(/[-+]/g))) &&
+                    while ((op = $(/^[-+]\s+/) || (input.charAt(i - 1) != ' ' && ($('+') || $('-')))) &&
                            (a = $(this.multiplication))) {
                         operation = new(tree.Operation)(op, [operation || m, a]);
                     }
@@ -1095,7 +1111,7 @@ less.Parser = function Parser(env) {
             property: function () {
                 var name;
 
-                if (name = $(/(\*?-?[-a-z_0-9]+)\s*:/g)) {
+                if (name = $(/^(\*?-?[-a-z_0-9]+)\s*:/)) {
                     return name[1];
                 }
             }
@@ -1763,9 +1779,10 @@ tree.Quoted.prototype = {
 })(require('less/tree'));
 (function (tree) {
 
-tree.Rule = function (name, value, index) {
+tree.Rule = function (name, value, important, index) {
     this.name = name;
     this.value = (value instanceof tree.Value) ? value : new(tree.Value)([value]);
+    this.important = important ? ' ' + important.trim() : '';
     this.index = index;
 
     if (name.charAt(0) === '@') {
@@ -1775,12 +1792,14 @@ tree.Rule = function (name, value, index) {
 tree.Rule.prototype.toCSS = function (env) {
     if (this.variable) { return "" }
     else {
-        return this.name + (env.compress ? ':' : ': ') + this.value.toCSS(env) + ";";
+        return this.name + (env.compress ? ':' : ': ') +
+               this.value.toCSS(env) +
+               this.important + ";";
     }
 };
 
 tree.Rule.prototype.eval = function (context) {
-    return new(tree.Rule)(this.name, this.value.eval(context));
+    return new(tree.Rule)(this.name, this.value.eval(context), this.important, this.index);
 };
 
 tree.Shorthand = function (a, b) {
@@ -2188,7 +2207,7 @@ function createCSS(styles, sheet, lastModified) {
     if ((css = document.getElementById(id)) === null) {
         css = document.createElement('style');
         css.type = 'text/css';
-        css.media = 'screen';
+        css.media = sheet.media;
         css.id = id;
         document.getElementsByTagName('head')[0].appendChild(css);
     }
