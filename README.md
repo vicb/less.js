@@ -32,7 +32,7 @@ synopsis
 
 Get the pre-built version from the `dist/` folder, and include it as such:
 
-    <link rel="stylesheet/less" href="main.less" type="text/css">
+    <link rel="stylesheet/less" href="main.less" type="text/css" />
     <script src="less.js" type="text/javascript"></script>
 
 Note the `rel="stylesheet/less"` for all stylesheets you want to parse with LESS.
