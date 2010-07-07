@@ -44,6 +44,9 @@
     color: grey;
   }
 */
+#first, #second {
+  color: red;
+}
 #last {
   color: blue;
 }
